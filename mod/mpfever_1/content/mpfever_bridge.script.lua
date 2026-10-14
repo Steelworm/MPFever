@@ -5352,7 +5352,8 @@ H.newroad = function(from, p)
 	end
 end
 
--- Builder lead scenario (MPFEVER_BUILDLEAD=1 on every game, MPFEVER_SCENARIO=buildlead; MPFEVER_SPEED=n runs it at that speed):
+-- Builder lead scenario (MPFEVER_BUILDLEAD=1 on every game, MPFEVER_SCENARIO=buildlead; MPFEVER_SPEED=n runs it at that speed;
+-- without the switch the same roads are held the usual way, to compare the answers):
 -- this game is the builder with a construction tool in hand and lays MPFEVER_BUILDLEAD_COUNT (4) roads one after the other,
 -- MPFEVER_BUILDLEAD_GAP (40) frames after the answer to the previous one, each sent like a tool's build. Once the other games stay
 -- behind this one (at most 30 s), they are released at once: the log shows "BUILDLEAD ... released at once" and the step each
@@ -5365,10 +5366,6 @@ H.buildlead = function(from, p)
 	AUTO.results = {}
 	AUTO.points = {}
 	local function say(t) log("AUTOTEST buildlead " .. t); AUTO.results[#AUTO.results + 1] = t end
-	if not G.buildLead then
-		say("needs MPFEVER_BUILDLEAD=1 on every game: nothing done")
-		return autoFinish()
-	end
 	local count = tonumber(os.getenv("MPFEVER_BUILDLEAD_COUNT") or "4") or 4
 	local gap = tonumber(os.getenv("MPFEVER_BUILDLEAD_GAP") or "40") or 40
 	local startFrame = G.frames
@@ -5426,7 +5423,13 @@ H.buildlead = function(from, p)
 			G.waits[#G.waits + 1] = { at = G.frames + gap, fn = nextBuild }
 		end
 	end
-	waitLead()
+	-- (without the switch the same builds are held the usual way: the baseline to compare the answers with)
+	if G.buildLead then
+		waitLead()
+	else
+		say("MPFEVER_BUILDLEAD is off: the builds are held the usual way (baseline)")
+		nextBuild()
+	end
 end
 
 -- Stop scenario: which proposal form can put a bus stop on an existing street segment?
