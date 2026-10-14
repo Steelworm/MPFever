@@ -1892,12 +1892,15 @@ local function terrainLead(why, what)
 	G.terrainActiveUntil = os.clock() + TERRAIN_ACTIVE_SECONDS
 	-- (what: BUILDLEAD says it is a construction tool; the terrain tools' callers give nothing)
 	if first then log((what or "terrain tool") .. " in hand (" .. tostring(why) .. "): the other games stay behind this one") end
+	-- (BUILDLEAD: until when the lead also comes from a terrain tool, see G.leadYields)
+	if G.buildLead and what == nil then G.terrainToolUntil = G.terrainLeadUntil end
 end
 
 -- 0: no terrain tool in hand, 1: picked a while ago, 2: picked or used in the last seconds
 local function leadLevel()
 	local now = os.clock()
 	if not G.terrainLeadUntil or now >= G.terrainLeadUntil then return 0 end
+	if G.buildLead and G.leadYields() then return 0 end
 	if G.terrainActiveUntil and now < G.terrainActiveUntil then return 2 end
 	return 1
 end
@@ -1945,6 +1948,23 @@ end
 -- bulldozer; a list guessed from the native module's tool classes named ids the game does not have.)
 G.buildLeadTool = function(id)
 	return type(id) == "string" and id ~= "" and not id:lower():find("^terrain")
+end
+
+-- A lead that comes from construction tools only gives way while another game's build is announced to this one: that game
+-- stamped it ahead of this one's clock and must come up to its time to release it, which the lead (that game stays well behind
+-- this one) would keep it from: both games would wait for each other until the hold expires (30 s) and the build would land late.
+-- Meanwhile this game releases nothing at once (buildLeadState). A terrain tool's lead does not give way: its edits are made at
+-- once, a game coming up to this one could pass them (the case of 0.3.10, unchanged).
+G.leadYields = function()
+	if G.terrainToolUntil and os.clock() < G.terrainToolUntil then return false end
+	for _, w in ipairs(G.natWait or {}) do
+		if not w.lead then
+			if not G.leadYielding then G.leadYielding = true; log("BUILDLEAD: the lead gives way while the build of " .. tostring(w.origin) .. " for t=" .. tostring(w.at) .. " is due") end
+			return true
+		end
+	end
+	if G.leadYielding then G.leadYielding = nil; log("BUILDLEAD: the lead is back") end
+	return false
 end
 
 -- The steps a build released at once may land at, after the time it was released at: this game does not run further while it
@@ -2003,6 +2023,7 @@ G.buildLeadState = function()
 	if not G.buildLead then return false, "off" end
 	if not G.session.started then return false, "the session has not started" end
 	if G.session.pauseAt ~= nil then return false, "the session is paused" end
+	if G.leadYields() then return false, "the lead gives way to another game's build" end
 	local mine = leadLevel()
 	if mine == 0 then return false, "no tool in hand" end
 	local okT, now = pcall(gameTime)
