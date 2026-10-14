@@ -1760,11 +1760,14 @@ end
 local O = {}
 local G = {
 	oldHolds = os.getenv("MPFEVER_OLDHOLDS") == "1",   -- (tests: the stop logic of 0.3.9 and before, issue #34)
+	-- (experimental, off by default: the builder leads, see buildLeadState; read once, every new path below is guarded by it)
+	buildLead = os.getenv("MPFEVER_BUILDLEAD") == "1",
 	inOff = 0, uiOff = 0, frames = 0, started = false, me = C.NAME, connected = false,
 	session = { speed = 0, pauseAt = nil, started = false },
 	peers = {},                -- other players' clocks (barrier)
 	oseq = 0, outSent = 0, lastClock = -1,
 	hashSent = -1, resultsSeen = {}, lastSet = -1,
+	leadStats = { atOnce = 0, held = 0, shipped = 0 },   -- (BUILDLEAD: builds released at once / held the usual way / shipped from the first)
 	waits = {}, pendingPaused = {}, holdAt = nil, bind = {}, rev = {},
 	ahead = 3, stampFloor = 0,    -- steps ahead of this game's stamps; no stamp below what others were allowed
 }
@@ -1867,11 +1870,12 @@ end
 -- seconds, 1 for one picked a while ago: the higher level leads; two players at the same level: normal barrier between them.
 local TERRAIN_LEAD_SECONDS = 60
 local TERRAIN_ACTIVE_SECONDS = 10
-local function terrainLead(why)
+local function terrainLead(why, what)
 	local first = not G.terrainLeadUntil or os.clock() >= G.terrainLeadUntil
 	G.terrainLeadUntil = os.clock() + TERRAIN_LEAD_SECONDS
 	G.terrainActiveUntil = os.clock() + TERRAIN_ACTIVE_SECONDS
-	if first then log("terrain tool in hand (" .. tostring(why) .. "): the other games stay behind this one") end
+	-- (what: BUILDLEAD says it is a construction tool; the terrain tools' callers give nothing)
+	if first then log((what or "terrain tool") .. " in hand (" .. tostring(why) .. "): the other games stay behind this one") end
 end
 
 -- 0: no terrain tool in hand, 1: picked a while ago, 2: picked or used in the last seconds
@@ -1898,6 +1902,70 @@ local function otherLeads()
 	local mine = leadLevel()
 	for _, pc in pairs(G.peers) do if (pc.tl or 0) > mine then return true end end
 	return false
+end
+
+-- ---------------------------------------------------------------- the builder leads (experimental, MPFEVER_BUILDLEAD=1)
+-- A tool's build is held by the native module until a game time 8 steps ahead, and the builder's game stops for it (issue
+-- #34): a build appears about 2 s after the click, and the tool cannot place the next piece before. Here the construction tools
+-- get the lead the terrain tools have: while a player has one in hand, that game LEADS (the others stay a few steps behind it,
+-- see terrainLeadSteps) and its builds are not held at all: they are released at once, the engine applies them at the next
+-- step wherever the game is, the capture ships the step they were applied at ("built here at t=..."), and the other games, far
+-- enough behind, apply them there. Nothing else changes: two players at the same level, a paused session and every game that
+-- does not take part (no "bl" in its clock) keep the held builds of today.
+-- What makes it safe (a game must never pass the step a build lands at before it has the build):
+--  * every other game is known to stay well behind this one when a build is released (buildLeadState: it says in its clock that
+--    it follows this game's lead, and its clock is at least its overshoot plus the room to stop exactly, behind this one's);
+--  * the build is announced at once ("nat_pending", marked "lead") for this game's current time. That is a LOWER bound of the
+--    step it lands at: a game that has not got the build holds there (nativeHoldAt), so it cannot go past the real step either,
+--    whatever the delays are; the real step (the capture's) replaces it when the build arrives (nativeReceived);
+--  * while a released build has not been shipped, this game does not run on for long (leadCap in pacing), so that the others
+--    do not come up against that hold.
+local BUILD_LEAD_TOOLS = {
+	-- (the ids of the tools' events in guiHandleEvent; the ones whose builds the native module holds, see UI_SITES in the DLL)
+	trackBuilder = true, streetBuilder = true, constructionBuilder = true, streetTerminalBuilder = true, bulldozer = true,
+	moduleBuilder = true, laneModifier = true, trackModifier = true,
+}
+
+-- The other games' clocks say whether they can follow a builder's lead ("bl" 1; 2: and this game follows another one's lead
+-- right now). Is it right to take a construction tool in hand for a lead? Only when every other game can follow.
+local function buildLeadPeers()
+	local n = 0
+	for _, pc in pairs(G.peers) do
+		n = n + 1
+		if (pc.bl or 0) < 1 then return false end
+	end
+	return n > 0
+end
+
+-- a construction tool is in the player's hand (its events, see guiHandleEvent)
+local function buildToolSeen(id)
+	if not BUILD_LEAD_TOOLS[id] or not buildLeadPeers() then return end
+	terrainLead(id, "BUILDLEAD: construction tool")
+end
+
+-- Is this game leading right now, so that a tool's build is released at once? Returns true, or false and why not.
+local function buildLeadState()
+	if not G.buildLead then return false, "off" end
+	if not G.session.started then return false, "the session has not started" end
+	if G.session.pauseAt ~= nil then return false, "the session is paused" end
+	local mine = leadLevel()
+	if mine == 0 then return false, "no tool in hand" end
+	local okT, now = pcall(gameTime)
+	if not okT then return false, "no clock" end
+	-- the steps a game follows behind the leader's last reported clock are terrainLeadSteps(); it may be as far as its overshoot
+	-- past that (the barrier keeps a reserve for it), and must still have the room to stop exactly at the announced step
+	local need = (terrainLeadSteps() - overshootReserve()) * STEP
+	local n = 0
+	for name, pc in pairs(G.peers) do
+		n = n + 1
+		if (pc.tl or 0) >= mine then return false, tostring(name) .. " leads too (same level)" end
+		if (pc.bl or 0) < 2 then return false, tostring(name) .. " does not follow yet" end
+		if type(pc.t) ~= "number" or pc.t > now - need then
+			return false, tostring(name) .. " is only " .. (type(pc.t) == "number" and ((now - pc.t) / STEP) or "?") .. " steps behind (needs " .. (need / STEP) .. ")"
+		end
+	end
+	if n == 0 then return false, "no other game" end
+	return true
 end
 
 -- the speed this game may run at: session speed, never past the slowest other player (barrier), stop points
@@ -1933,6 +2001,16 @@ local function pacing()
 		if G.oldHolds then exact = limit end
 		if barrier == nil or limit < barrier then barrier = limit end
 		if exactBarrier == nil or exact < exactBarrier then exactBarrier = exact end
+	end
+	-- BUILDLEAD: a build released at once and not shipped yet (leadCapAt, see guiUpdate): this game does not run on beyond it, as
+	-- far as the others are concerned like a barrier (they hold at the build's step anyway, this keeps them from coming up to it)
+	if G.buildLead and G.leadCapAt and s.pauseAt == nil then
+		if barrier == nil or G.leadCapAt < barrier then barrier = G.leadCapAt end
+		if exactBarrier == nil or G.leadCapAt < exactBarrier then exactBarrier = G.leadCapAt end
+		if now >= G.leadCapAt and G.leadCapLogged ~= G.leadCapAt then
+			G.leadCapLogged = G.leadCapAt
+			log("BUILDLEAD cap: this game stops at t=" .. G.leadCapAt .. " (now " .. now .. ") until the build released at once has been shipped [frame " .. G.frames .. "]")
+		end
 	end
 	if barrier and (stopAt == nil or barrier < stopAt) then stopAt = barrier end
 	G.lastBarrier = barrier
@@ -2027,7 +2105,9 @@ H.peerclock = function(from, p)
 	if p.name and p.name ~= G.me then
 		local was = G.peers[p.name] and G.peers[p.name].tl or 0
 		local tl = tonumber(p.tl) or 0
-		G.peers[p.name] = { t = p.t, ah = p.ah, tl = tl > 0 and tl or nil }
+		-- (bl: the game takes part in BUILDLEAD, 1; 2: and it follows another game's lead now; only sent with the switch on)
+		local bl = tonumber(p.bl)
+		G.peers[p.name] = { t = p.t, ah = p.ah, tl = tl > 0 and tl or nil, bl = bl and bl > 0 and bl or nil }
 		if (tl > 0) ~= (was > 0) then
 			log(tostring(p.name) .. (tl > 0 and " has a terrain tool in hand: the game that used it last leads" or " put the terrain tool away"))
 		end
@@ -2056,13 +2136,14 @@ local function adaptAhead(base)
 	return math.max(math.ceil(base * 0.6), math.min(base, math.ceil(mx * 1.5) + 4))
 end
 
-local function logMargin(kind, at, origin)
+local function logMargin(kind, at, origin, lead)
 	local ok, now = pcall(gameTime)
 	if ok and type(at) == "number" then
 		local m = (at - now) / STEP
 		-- what the stamp's distance lost on the way: the other game's lead and the network
+		-- (BUILDLEAD: a build released at once was not stamped ahead: its margin says nothing about the stamp distance)
 		local pa = origin and G.peers[origin] and G.peers[origin].ah
-		if pa and (kind == "nat_pending" or kind == "act") then
+		if pa and not lead and (kind == "nat_pending" or kind == "act") then
 			table.insert(G.consumed, pa + (kind == "nat_pending" and 1 or 0) - m)
 			if #G.consumed > 12 then table.remove(G.consumed, 1) end
 		end
@@ -2072,7 +2153,7 @@ local function logMargin(kind, at, origin)
 end
 
 H.act = function(from, p)
-	logMargin(p.native and "act(native)" or "act", p.at, p.origin)
+	logMargin(p.native and "act(native)" or "act", p.at, p.origin, p.lead)
 	p.recvFrame = G.frames
 	if p.native then
 		G.nativeQueue[#G.nativeQueue + 1] = p
@@ -3210,7 +3291,7 @@ local function nativeHoldAt()
 		if now < e or not stopped then return e end   -- (inside the margin while still running: stop where it is)
 		return at
 	end
-	for _, r in ipairs(G.natRelease) do local t = approach(r.at) if m == nil or t < m then m = t end end
+	for _, r in ipairs(G.natRelease) do if not r.lead then local t = approach(r.at) if m == nil or t < m then m = t end end end
 	for _, w in ipairs(G.natWait) do local t = approach(w.at) if m == nil or t < m then m = t end end
 	-- other players' builds already received: this game must stop exactly at their time
 	if (G.replayOut or 0) > 0 and G.frames - (G.replaySince or 0) > 600 then
@@ -3230,9 +3311,20 @@ end
 
 H.nat_pending = function(from, p)
 	if p.origin == G.me then return end
-	logMargin("nat_pending", p.at, p.origin)
-	G.natWait[#G.natWait + 1] = { origin = p.origin, id = p.id, at = p.at, since = G.frames }
-	log("native build of " .. tostring(p.origin) .. " announced for t=" .. tostring(p.at) .. ": holding there")
+	logMargin("nat_pending", p.at, p.origin, p.lead)
+	G.natWait[#G.natWait + 1] = { origin = p.origin, id = p.id, at = p.at, since = G.frames, lead = p.lead }
+	if p.lead then
+		-- BUILDLEAD: the builder released it at once; the time is only the earliest the build can land at (its game's time when it
+		-- was released), the real one comes with the build (nativeReceived). Holding there keeps this game from passing it.
+		local okT, nowT = pcall(gameTime)
+		log("BUILDLEAD native build of " .. tostring(p.origin) .. " released at once at t=" .. tostring(p.at) .. " (this game is at " .. tostring(okT and nowT or "?") .. "): holding there until it arrives")
+		if okT and p.at < nowT then
+			log("BUILDLEAD WARNING: this game is already past t=" .. tostring(p.at) .. ": the build will land late here (desync risk)")
+			G.aheadLocked = true
+		end
+	else
+		log("native build of " .. tostring(p.origin) .. " announced for t=" .. tostring(p.at) .. ": holding there")
+	end
 end
 
 -- While the build waits for its game time (about two seconds), a translucent circle on the ground where the player
@@ -3300,13 +3392,29 @@ local function pollNativeEvents()
 			-- the tool's Context flags (1 gatherBuildings, 2 terrain alignment, 4 street graph cleanup; 32 = known), shipped with the build
 			local cbits = tonumber(line:match("^deferred %d+ (%d+)"))
 			if cbits then G.natCtx = G.natCtx or {}; G.natCtx[id] = cbits end
-			markPending(id)
 			local now = gameTime()
 			local paused = G.session.pauseAt ~= nil and now >= G.session.pauseAt
-			local at = paused and pausedStamp(now) or (stampFor(now) + STEP)
-			G.natRelease[#G.natRelease + 1] = { id = id, at = at }
-			send("nat_pending", { origin = G.me, at = at, id = id })
-			log("native build " .. id .. " held by the DLL, released at t=" .. at .. " (now " .. now .. ") [frame " .. G.frames .. "]")
+			-- BUILDLEAD: this game leads, and the others stay well behind it: no hold, no circle on the ground, the build goes to the
+			-- engine in this very frame (runNativeRelease). It is announced for the time this game is at: the earliest it can land at.
+			local lead, why = false, nil
+			if G.buildLead and not paused then lead, why = buildLeadState() end
+			if lead then
+				G.natRelease[#G.natRelease + 1] = { id = id, at = now, lead = true }
+				send("nat_pending", { origin = G.me, at = now, id = id, lead = true })
+				G.leadStats.atOnce = G.leadStats.atOnce + 1
+				log("BUILDLEAD native build " .. id .. " released at once at t=" .. now .. " (it lands at this step or a few later) [frame " .. G.frames .. "]")
+			else
+				markPending(id)
+				local at = paused and pausedStamp(now) or (stampFor(now) + STEP)
+				G.natRelease[#G.natRelease + 1] = { id = id, at = at }
+				send("nat_pending", { origin = G.me, at = at, id = id })
+				log("native build " .. id .. " held by the DLL, released at t=" .. at .. " (now " .. now .. ") [frame " .. G.frames .. "]")
+				-- (with a tool in hand, the reason it is held the usual way: which test of buildLeadState failed)
+				if G.buildLead and leadLevel() > 0 then
+					G.leadStats.held = G.leadStats.held + 1
+					log("BUILDLEAD native build " .. id .. " held the usual way: " .. tostring(why or "the session is paused"))
+				end
+			end
 		end
 	end
 end
@@ -3317,10 +3425,24 @@ local function deferredSend(cmd, cb)
 	local now = gameTime()
 	G.autoBuildSeq = G.autoBuildSeq + 1
 	local id = 100000 + G.autoBuildSeq
+	-- BUILDLEAD: as a real tool's build when this game leads (see pollNativeEvents)
+	local lead, why = false, nil
+	if G.buildLead then lead, why = buildLeadState() end
+	if lead then
+		G.natRelease[#G.natRelease + 1] = { id = id, at = now, lead = true, fn = function() O.sendCommand(cmd, cb) end }
+		send("nat_pending", { origin = G.me, at = now, id = id, lead = true })
+		G.leadStats.atOnce = G.leadStats.atOnce + 1
+		log("BUILDLEAD autotest build " .. id .. " released at once at t=" .. now .. " [frame " .. G.frames .. "]")
+		return
+	end
 	local at = stampFor(now) + STEP
 	G.natRelease[#G.natRelease + 1] = { id = id, at = at, fn = function() O.sendCommand(cmd, cb) end }
 	markPending(id, { x = 0, y = 0 })
 	log("autotest build " .. id .. " held, released at t=" .. at .. " (now " .. now .. ") [frame " .. G.frames .. "]")
+	if G.buildLead then
+		G.leadStats.held = G.leadStats.held + 1
+		log("BUILDLEAD autotest build " .. id .. " held the usual way: " .. tostring(why))
+	end
 	send("nat_pending", { origin = G.me, at = at, id = id })
 end
 
@@ -3357,7 +3479,7 @@ end
 local function releaseOne(r, at, how)
 	G.natReleased = G.natReleased + 1
 	G.natShipIds = G.natShipIds or {}
-	G.natShipIds[#G.natShipIds + 1] = { id = r.id, at = at, frame = G.frames, combined = how ~= nil }
+	G.natShipIds[#G.natShipIds + 1] = { id = r.id, at = at, frame = G.frames, combined = how ~= nil, lead = r.lead }
 	if r.fn then
 		-- a scripted build (autotest) deferred like the tools' ones: sent now, at its announced time
 		G.natReleased = G.natReleased - 1
@@ -3377,13 +3499,31 @@ local function runNativeRelease()
 	local now = gameTime()
 	local keep = {}
 	for _, r in ipairs(G.natRelease) do
-		if now >= r.at and gameSpeed() == 0 then
+		if r.lead then
+			-- (BUILDLEAD: at once, the game keeps running; r.at is the time it was announced for, the earliest it can land at)
+			releaseOne(r, now, " at once (BUILDLEAD)")
+		elseif now >= r.at and gameSpeed() == 0 then
 			releaseOne(r, now)
 		else
 			keep[#keep + 1] = r
 		end
 	end
 	G.natRelease = keep
+end
+
+-- BUILDLEAD: the time this game does not run past while a build it released at once has not been shipped (pacing). The others
+-- hold at the build's earliest step (nat_pending) so they cannot pass its real one, and they stay terrainLeadSteps behind this
+-- game's clock; they come up to that hold only when this game's clock is the lead minus their overshoot past the build's time
+-- (they stop at most their overshoot past the barrier). The cap keeps the clock short of that, so the shipped build is there
+-- before any game could wait for it. (Normally the build is applied within the next command swap and seen by the interface
+-- at the next handshake, that is two handshakes of simulation steps; the cap is the lead minus the overshoot, minus one.)
+local function updateLeadCap()
+	G.leadCapAt = nil
+	local ref = nil
+	for _, e in ipairs(G.natShipIds or {}) do
+		if e.lead and (ref == nil or e.at < ref) then ref = e.at end
+	end
+	if ref then G.leadCapAt = ref + (terrainLeadSteps() - overshootReserve() - 1) * STEP end
 end
 
 local function expireNativeWaits()
@@ -3985,14 +4125,25 @@ local function shipNativeBuilds(st)
 				native = true, paused = o.paused, co = G.myCo }
 			if G.natShipIds and #G.natShipIds > 0 then
 				-- the released build that was built at this time; the ones released before it and not shipped were refused
+				-- (BUILDLEAD: a build released at once lands at some step at or after the time it was released at, the first of
+				-- those released and not shipped is the one, builds are applied in the order they were released in)
 				local k = nil
-				for i, e in ipairs(G.natShipIds) do if e.at == o.at then k = i; break end end
+				for i, e in ipairs(G.natShipIds) do
+					if e.at == o.at or (e.lead and e.at <= o.at) then k = i; break end
+				end
 				k = k or 1
-				if G.natShipIds[k].at ~= o.at then
+				local ek = G.natShipIds[k]
+				if ek.at ~= o.at and not (ek.lead and ek.at <= o.at) then
 					log("WARNING: a native build landed at t=" .. tostring(o.at) .. " instead of t=" .. tostring(G.natShipIds[k].at) .. " (desync risk)")
 				end
 				for i = 1, k - 1 do cancelNativeBuild(G.natShipIds[i], "refused before a later build") end
 				a.natId = G.natShipIds[k].id
+				if ek.lead then
+					a.lead = true
+					G.leadStats.shipped = G.leadStats.shipped + 1
+					log("BUILDLEAD native build " .. tostring(ek.id) .. " landed at t=" .. tostring(o.at) .. " (released at once at t=" .. tostring(ek.at) .. ", "
+						.. ((o.at - ek.at) / STEP) .. " step(s) later; this game is at t=" .. tostring(gameTime()) .. ", " .. (G.frames - ek.frame) .. " frames after the release)")
+				end
 			if G.natCtx and G.natCtx[a.natId] then a.ctx = G.natCtx[a.natId]; G.natCtx[a.natId] = nil end
 				local rest = {}
 				for i = k + 1, #G.natShipIds do rest[#rest + 1] = G.natShipIds[i] end
@@ -5199,6 +5350,83 @@ H.newroad = function(from, p)
 		AUTO.results[#AUTO.results + 1] = "new road error " .. tostring(err)
 		autoFinish()
 	end
+end
+
+-- Builder lead scenario (MPFEVER_BUILDLEAD=1 on every game, MPFEVER_SCENARIO=buildlead; MPFEVER_SPEED=n runs it at that speed):
+-- this game is the builder with a construction tool in hand and lays MPFEVER_BUILDLEAD_COUNT (4) roads one after the other,
+-- MPFEVER_BUILDLEAD_GAP (40) frames after the answer to the previous one, each sent like a tool's build. Once the other games stay
+-- behind this one (at most 30 s), they are released at once: the log shows "BUILDLEAD ... released at once" and the step each
+-- landed at ("landed at"), the other games "released at once ... holding there" and the replay at that step. The launcher's checks
+-- at the end of the autotest tell whether the games ended identical. The answer of each build (frames from sending it to the
+-- engine's verdict) is in the results: a tool places its next piece after that answer.
+H.buildlead = function(from, p)
+	if p.role ~= C.ROLE or AUTO.running then return end
+	AUTO.running = true
+	AUTO.results = {}
+	AUTO.points = {}
+	local function say(t) log("AUTOTEST buildlead " .. t); AUTO.results[#AUTO.results + 1] = t end
+	if not G.buildLead then
+		say("needs MPFEVER_BUILDLEAD=1 on every game: nothing done")
+		return autoFinish()
+	end
+	local count = tonumber(os.getenv("MPFEVER_BUILDLEAD_COUNT") or "4") or 4
+	local gap = tonumber(os.getenv("MPFEVER_BUILDLEAD_GAP") or "40") or 40
+	local startFrame = G.frames
+	local stats0 = { atOnce = G.leadStats.atOnce, held = G.leadStats.held, shipped = G.leadStats.shipped }
+	local built, answers = 0, {}
+	local nextBuild
+	-- a player aiming with the street tool: its events keep the lead up
+	local function aim() buildToolSeen("streetBuilder") end
+	local function finish()
+		say("done: " .. built .. " builds, " .. (G.leadStats.atOnce - stats0.atOnce) .. " released at once, " .. (G.leadStats.held - stats0.held)
+			.. " held the usual way, " .. (G.leadStats.shipped - stats0.shipped) .. " shipped from a lead; answers after "
+			.. table.concat(answers, "/") .. " frames")
+		G.waits[#G.waits + 1] = { at = G.frames + 90, fn = autoFinish }
+	end
+	local function waitLead()
+		aim()
+		local ok, why = buildLeadState()
+		if ok or G.frames - startFrame > 1800 then
+			say(ok and ("the lead is established after " .. (G.frames - startFrame) .. " frames")
+				or ("no lead after " .. (G.frames - startFrame) .. " frames: " .. tostring(why) .. " (the builds go the usual way)"))
+			return nextBuild()
+		end
+		G.waits[#G.waits + 1] = { at = G.frames + 5, fn = waitLead }
+	end
+	nextBuild = function()
+		aim()
+		if built >= count then return finish() end
+		built = built + 1
+		local i = built
+		local k = (p.offset or 0) + 20 + i * 5
+		local okp, err = pcall(function()
+			local n, info, pn, a = matrixPlace(k)
+			local o = { tlanes = true, template = true, roadType = true, street = true, owner = true, positions = true, sharedIds = true,
+				tmpl = { roadTemplate = info.c.roadTemplate, roadStyle = info.c.roadStyle, roadType = info.c.roadType } }
+			local sp = buildMatrixProposal(o, n, pn, a)
+			local ctx = api.type.Context.new()
+			ctx.checkTerrainAlignment = true
+			ctx.cleanupStreetGraph = os.getenv("MPFEVER_CLEANUP") == "1"
+			ctx.gatherBuildings = true
+			ctx.gatherFields = true
+			ctx.player = api.engine.util.getPlayer()
+			local edges0, frame0 = edgeCount(), G.frames
+			deferredSend(api.cmd.makeWorldBuildProposalCmd(sp, ctx, false, true), function(res, success)
+				local why = ""
+				if not success then pcall(function() why = C.ser(C.marshal(res.resultProposalData.errorState.messages)) end) end
+				answers[#answers + 1] = G.frames - frame0
+				say("road " .. i .. " from node " .. n .. ": " .. (success and "built" or ("refused " .. why)) .. ", answer after " .. (G.frames - frame0)
+					.. " frames, edges " .. edges0 .. " -> " .. edgeCount())
+				if success then AUTO.points[#AUTO.points + 1] = pn end
+				G.waits[#G.waits + 1] = { at = G.frames + gap, fn = nextBuild }
+			end)
+		end)
+		if not okp then
+			say("road " .. i .. " failed: " .. shortErr(err))
+			G.waits[#G.waits + 1] = { at = G.frames + gap, fn = nextBuild }
+		end
+	end
+	waitLead()
 end
 
 -- Stop scenario: which proposal form can put a bus stop on an existing street segment?
@@ -8184,6 +8412,7 @@ local function guiUpdate(userParams, state, guiState)
 	if not okn then log("native replays failed: " .. tostring(errn)) end
 
 	if G.connected then
+		if G.buildLead then updateLeadCap() end
 		local okp, sp = pcall(pacing)
 		if okp then
 			if gameSpeed() ~= sp then G.lastSet = -1 end
@@ -8211,11 +8440,16 @@ local function guiUpdate(userParams, state, guiState)
 		local okt, t = pcall(gameTime)
 		local tl = leadLevel()
 		if tl == 0 then tl = nil end
-		if okt and (t ~= G.lastClock or G.frames % 30 == 0 or tl ~= G.lastTl) then
+		-- BUILDLEAD: this game takes part (1), and follows another game's lead (2): the leader releases its builds at once only
+		-- when every other game says 2 (nothing is sent without the switch)
+		local bl = nil
+		if G.buildLead then bl = otherLeads() and 2 or 1 end
+		if okt and (t ~= G.lastClock or G.frames % 30 == 0 or tl ~= G.lastTl or bl ~= G.lastBl) then
 			G.lastClock = t
 			G.lastTl = tl
+			G.lastBl = bl
 			G.stampFloor = math.max(G.stampFloor, t + G.ahead * STEP)
-			send("clock", { t = t, sp = gameSpeed(), ah = G.ahead, tl = tl })
+			send("clock", { t = t, sp = gameSpeed(), ah = G.ahead, tl = tl, bl = bl })
 		end
 	end
 
@@ -8260,6 +8494,8 @@ local function guiHandleEvent(userParams, state, guiState, src, id, name, param)
 		G.evSeen = G.evSeen or {}
 		local key = tostring(id) .. "/" .. name
 		if not G.evSeen[key] then G.evSeen[key] = true; log("tool event: " .. key) end
+		-- BUILDLEAD: a construction tool is in hand (it sends these while the player aims, as well as when it builds)
+		if G.buildLead then buildToolSeen(tostring(id)) end
 	end
 end
 
