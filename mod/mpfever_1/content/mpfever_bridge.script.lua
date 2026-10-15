@@ -5722,6 +5722,57 @@ end
 -- (the builder of the terrain lead scenario is done: the leader puts the terrain tool away)
 H.terrainlead_stop = function(from, p) G.tlHold = nil end
 
+-- Build and demolish scenario (MPFEVER_SCENARIO=dozenew): this game lays a road and demolishes its new segments a second after
+-- the engine's answer, three times, each sent like a tool's build (with MPFEVER_BUILDLEAD=1 once it leads, with the street tool
+-- in hand). The game gives money back for something just built; the costs of both are logged on every game ("build stats"),
+-- so the logs show whether the replaying game pays the same as the builder.
+H.dozenew = function(from, p)
+	if p.role ~= C.ROLE or AUTO.running then return end
+	AUTO.running = true
+	AUTO.results = {}
+	AUTO.points = {}
+	local function say(t) log("AUTOTEST dozenew " .. t); AUTO.results[#AUTO.results + 1] = t end
+	local i, startFrame = 0, G.frames
+	local function aim() if G.buildLead then G.buildToolSeen("streetBuilder") end end
+	local nextOne
+	local function edgeSet() local s = {} for _, e in ipairs(R.allEdges()) do s[e] = true end return s end
+	nextOne = function()
+		aim()
+		if i >= 3 then G.waits[#G.waits + 1] = { at = G.frames + 120, fn = autoFinish }; return end
+		i = i + 1
+		local n0 = i
+		local okp, err = pcall(function()
+			local n, info, pn, a = matrixPlace((p.offset or 0) + 60 + n0 * 5)
+			local o = { tlanes = true, template = true, roadType = true, street = true, owner = true, positions = true, sharedIds = true,
+				tmpl = { roadTemplate = info.c.roadTemplate, roadStyle = info.c.roadStyle, roadType = info.c.roadType } }
+			local sp = buildMatrixProposal(o, n, pn, a)
+			local before = edgeSet()
+			deferredSend(api.cmd.makeWorldBuildProposalCmd(sp, playerContext(), false, true), function(res, success)
+				local new = {}
+				for _, e in ipairs(R.allEdges()) do if not before[e] then new[#new + 1] = e end end
+				say("road " .. n0 .. ": " .. (success and "built" or "refused") .. ", new segments " .. table.concat(new, ","))
+				if not success or #new == 0 then G.waits[#G.waits + 1] = { at = G.frames + 40, fn = nextOne }; return end
+				G.waits[#G.waits + 1] = { at = G.frames + 60, fn = function()
+					aim()
+					local okr, P = pcall(function() return api.engine.util.proposal.makeSegmentsRemoveProposal(new) end)
+					if not okr or not P then say("road " .. n0 .. ": no removal proposal " .. tostring(P)); return nextOne() end
+					deferredSend(api.cmd.makeWorldBuildProposalCmd(P, playerContext(), false, true), function(res2, success2)
+						say("road " .. n0 .. ": " .. (success2 and "demolished" or "demolition refused"))
+						G.waits[#G.waits + 1] = { at = G.frames + 40, fn = nextOne }
+					end)
+				end }
+			end)
+		end)
+		if not okp then say("road " .. n0 .. " failed: " .. shortErr(err)); G.waits[#G.waits + 1] = { at = G.frames + 40, fn = nextOne } end
+	end
+	local function waitLead()
+		aim()
+		if not G.buildLead or G.buildLeadState() or G.frames - startFrame > 1800 then return nextOne() end
+		G.waits[#G.waits + 1] = { at = G.frames + 5, fn = waitLead }
+	end
+	waitLead()
+end
+
 -- Stop scenario: which proposal form can put a bus stop on an existing street segment?
 local function stopForms(E)
 	local c = api.engine.getComponent(E, api.type.ComponentType.BASE_EDGE)
