@@ -1887,22 +1887,35 @@ end
 local TERRAIN_LEAD_SECONDS = 60
 local TERRAIN_ACTIVE_SECONDS = 10
 local function terrainLead(why, what)
+	-- (what: BUILDLEAD says it is a construction tool, whose lead has its own times and ranks below a terrain tool's, see
+	-- leadLevel; the terrain tools' callers give nothing)
+	if what ~= nil then
+		local firstB = not G.buildLeadUntil or os.clock() >= G.buildLeadUntil
+		G.buildLeadUntil = os.clock() + TERRAIN_LEAD_SECONDS
+		G.buildActiveUntil = os.clock() + TERRAIN_ACTIVE_SECONDS
+		if firstB then log(what .. " in hand (" .. tostring(why) .. "): the other games stay behind this one") end
+		return
+	end
 	local first = not G.terrainLeadUntil or os.clock() >= G.terrainLeadUntil
 	G.terrainLeadUntil = os.clock() + TERRAIN_LEAD_SECONDS
 	G.terrainActiveUntil = os.clock() + TERRAIN_ACTIVE_SECONDS
-	-- (what: BUILDLEAD says it is a construction tool; the terrain tools' callers give nothing)
-	if first then log((what or "terrain tool") .. " in hand (" .. tostring(why) .. "): the other games stay behind this one") end
-	-- (BUILDLEAD: until when the lead also comes from a terrain tool, see G.leadYields)
-	if G.buildLead and what == nil then G.terrainToolUntil = G.terrainLeadUntil end
+	if first then log("terrain tool in hand (" .. tostring(why) .. "): the other games stay behind this one") end
 end
 
 -- 0: no terrain tool in hand, 1: picked a while ago, 2: picked or used in the last seconds
+-- BUILDLEAD, when every game takes part: a terrain tool ranks above a construction tool, whatever the other game does (its
+-- edits are made at once and must stay covered by a lead): construction tools 1 (picked a while ago) or 2, terrain tools 3 or 4.
+-- (With a game that does not take part the levels of a terrain tool stay 1 and 2, as the others compare them.)
 local function leadLevel()
 	local now = os.clock()
-	if not G.terrainLeadUntil or now >= G.terrainLeadUntil then return 0 end
-	if G.buildLead and G.leadYields() then return 0 end
-	if G.terrainActiveUntil and now < G.terrainActiveUntil then return 2 end
-	return 1
+	local terr = 0
+	if G.terrainLeadUntil and now < G.terrainLeadUntil then terr = (G.terrainActiveUntil and now < G.terrainActiveUntil) and 2 or 1 end
+	if not G.buildLead or not G.buildLeadPeers() then return terr end
+	if terr > 0 then return terr + 2 end
+	if G.buildLeadUntil and now < G.buildLeadUntil and not G.leadYields() then
+		return (G.buildActiveUntil and now < G.buildActiveUntil) and 2 or 1
+	end
+	return 0
 end
 
 -- the steps a game may run past a stop point before its interface stops it (see the stamp distance)
@@ -1952,11 +1965,10 @@ end
 
 -- A lead that comes from construction tools only gives way while another game's build is announced to this one: that game
 -- stamped it ahead of this one's clock and must come up to its time to release it, which the lead (that game stays well behind
--- this one) would keep it from: both games would wait for each other until the hold expires (30 s) and the build would land late.
+-- this one) would keep it from: the other game would first wait for this one to reach the build's time (see pacing).
 -- Meanwhile this game releases nothing at once (buildLeadState). A terrain tool's lead does not give way: its edits are made at
 -- once, a game coming up to this one could pass them (the case of 0.3.10, unchanged).
 G.leadYields = function()
-	if G.terrainToolUntil and os.clock() < G.terrainToolUntil then return false end
 	for _, w in ipairs(G.natWait or {}) do
 		if not w.lead then
 			if not G.leadYielding then G.leadYielding = true; log("BUILDLEAD: the lead gives way while the build of " .. tostring(w.origin) .. " for t=" .. tostring(w.at) .. " is due") end
