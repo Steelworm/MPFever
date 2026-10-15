@@ -5677,7 +5677,11 @@ H.terrainlead = function(from, p)
 		send("terrainlead_stop", {})
 		G.waits[#G.waits + 1] = { at = G.frames + 90, fn = autoFinish }
 	end
+	-- (MPFEVER_TERRAINLEAD_AIM=1 with BUILDLEAD: this game also has a construction tool in hand, as a player who builds while the
+	-- other shapes the ground; the terrain tool's lead must still cover the other game's edits)
+	local function aim() if os.getenv("MPFEVER_TERRAINLEAD_AIM") == "1" and G.buildLead then G.buildToolSeen("streetBuilder") end end
 	local function waitLead()
+		aim()
 		local leads = otherLeads()
 		if leads or G.frames - startFrame > 1800 then
 			say(leads and ("the other game leads after " .. (G.frames - startFrame) .. " frames") or "no lead of the other game seen in 1800 frames")
@@ -5686,6 +5690,7 @@ H.terrainlead = function(from, p)
 		G.waits[#G.waits + 1] = { at = G.frames + 5, fn = waitLead }
 	end
 	nextRoad = function()
+		aim()
 		if built >= count then return finish() end
 		built = built + 1
 		local i = built
