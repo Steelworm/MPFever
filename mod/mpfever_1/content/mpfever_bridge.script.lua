@@ -2034,7 +2034,7 @@ local G = {
 	fastStill = os.getenv("MPFEVER_FASTSTILL") ~= "0",   -- (on by default for testing; MPFEVER_FASTSTILL=0 turns it off)
 	stillLog = os.getenv("MPFEVER_STEPLOG") ~= nil,
 	-- (experimental, off by default: the builder leads, see buildLeadState; read once, every new path below is guarded by it)
-	buildLead = os.getenv("MPFEVER_BUILDLEAD") == "1",
+	buildLead = os.getenv("MPFEVER_BUILDLEAD") ~= "0",   -- (on by default for testing; MPFEVER_BUILDLEAD=0 turns it off)
 	inOff = 0, uiOff = 0, frames = 0, started = false, me = C.NAME, connected = false,
 	session = { speed = 0, pauseAt = nil, started = false },
 	peers = {},                -- other players' clocks (barrier)
